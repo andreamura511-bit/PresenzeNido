@@ -110,11 +110,40 @@ function oraFormattata(){
   return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');
 }
 
+/**
+ * Chiama Google Apps Script tramite JSONP invece di fetch.
+ * Necessario perché gli script pubblicati da Google non impostano le
+ * intestazioni CORS richieste dal browser per un fetch normale — con
+ * JSONP la richiesta passa come un normale tag <script>, non soggetto
+ * a questa restrizione.
+ */
+function chiamaScript(parametri){
+  return new Promise((risolvi, rifiuta) => {
+    const nomeCallback = 'jsonp_cb_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+    const timeoutId = setTimeout(() => {
+      pulisci();
+      rifiuta(new Error('Nessuna risposta dal foglio (timeout)'));
+    }, 15000);
+
+    function pulisci(){
+      clearTimeout(timeoutId);
+      delete window[nomeCallback];
+      if (tag.parentNode) tag.parentNode.removeChild(tag);
+    }
+
+    window[nomeCallback] = (dati) => { pulisci(); risolvi(dati); };
+
+    const query = new URLSearchParams({ ...parametri, callback: nomeCallback });
+    const tag = document.createElement('script');
+    tag.src = URL_SCRIPT + '?' + query.toString();
+    tag.onerror = () => { pulisci(); rifiuta(new Error('Errore di rete verso Google')); };
+    document.body.appendChild(tag);
+  });
+}
+
 /** Legge tutte le righe direttamente dal foglio Google (sempre dati aggiornati) */
 async function leggiRegistroRemoto(){
-  const risposta = await fetch(URL_SCRIPT, { method: 'GET' });
-  if (!risposta.ok) throw new Error('Impossibile leggere il foglio (' + risposta.status + ')');
-  const righeGrezze = await risposta.json(); // array di array, prima riga = intestazioni
+  const righeGrezze = await chiamaScript({}); // nessuna azione = lettura
   return righeGrezze.slice(1)
     .filter(r => r.length >= 4 && r[0])
     .map(r => ({ op: String(r[0]), data: String(r[1]), ora: String(r[2]), tipo: String(r[3]) }));
@@ -122,11 +151,7 @@ async function leggiRegistroRemoto(){
 
 /** Scrive una nuova timbratura sul foglio Google */
 async function scriviTimbraturaRemota(riga){
-  await fetch(URL_SCRIPT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // evita il preflight CORS
-    body: JSON.stringify(riga)
-  });
+  await chiamaScript({ azione: 'scrivi', ...riga });
 }
 
 async function registraTimbratura(codice){
