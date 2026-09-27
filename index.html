@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Presenze Nido</title>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+:root{
+  --bg:#f5f5f4; --card:#ffffff; --text:#1c1c1c; --muted:#6b6b6b;
+  --accent:#2563eb; --accent-ink:#ffffff; --ok:#16a34a; --border:#e5e5e5;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#18181b; --card:#242427; --text:#f2f2f2; --muted:#a1a1aa;
+    --accent:#3b82f6; --border:#38383c;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#18181b; --card:#242427; --text:#f2f2f2; --muted:#a1a1aa;
+  --accent:#3b82f6; --border:#38383c;
+}
+*{box-sizing:border-box;}
+html,body{height:100%;}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+  display:flex; flex-direction:column; align-items:center;
+  padding:16px; gap:14px;
+}
+h1{font-size:1.3rem; margin:8px 0 0;}
+.sub{color:var(--muted); font-size:0.85rem; margin:0 0 4px; text-align:center;}
+.card{
+  width:100%; max-width:440px; background:var(--card);
+  border:1px solid var(--border); border-radius:14px; padding:18px;
+}
+.risultato{min-height:70px; display:flex; align-items:center; justify-content:center;
+  text-align:center; font-size:1.05rem; white-space:pre-line;}
+.btnrow{display:flex; gap:10px; width:100%; max-width:440px;}
+button{
+  flex:1; padding:16px; border-radius:12px; border:none;
+  font-size:1rem; font-weight:600; cursor:pointer;
+}
+.btn-primary{background:var(--accent); color:var(--accent-ink);}
+.btn-secondary{background:var(--card); color:var(--text); border:1px solid var(--border);}
+#video{width:100%; border-radius:12px; display:none; background:#000;}
+.log{width:100%; max-width:440px; overflow-x:auto;}
+table{width:100%; border-collapse:collapse; font-size:0.85rem;}
+th,td{padding:8px 6px; border-bottom:1px solid var(--border); text-align:left; white-space:nowrap;}
+.badge{padding:2px 8px; border-radius:999px; font-size:0.75rem; font-weight:600;}
+.badge-in{background:#dcfce7; color:#166534;}
+.badge-out{background:#fee2e2; color:#991b1b;}
+.foot{color:var(--muted); font-size:0.75rem; text-align:center; margin-top:6px;}
+</style>
+</head>
+<body>
+
+<h1>🏫 Presenze Nido — Test</h1>
+<p class="sub">Nessun login. Le timbrature vengono scritte sul foglio Google condiviso.</p>
+
+<div class="card">
+  <div id="risultato" class="risultato">Pronto. Scansiona un QR o leggi un tag NFC.</div>
+</div>
+
+<video id="video" playsinline muted></video>
+<canvas id="canvas" style="display:none;"></canvas>
+
+<div class="btnrow">
+  <button class="btn-primary" id="btnQr">📷 Scansiona QR</button>
+  <button class="btn-secondary" id="btnNfc">📶 Leggi NFC</button>
+</div>
+
+<div class="card log">
+  <strong>Registro</strong>
+  <table id="tabella">
+    <thead><tr><th>Operatore</th><th>Data</th><th>Ora</th><th>Tipo</th></tr></thead>
+    <tbody id="corpoTabella"></tbody>
+  </table>
+</div>
+
+<div class="btnrow">
+  <button class="btn-secondary" id="btnCsv">⬇️ Esporta Excel</button>
+  <button class="btn-secondary" id="btnReset">🔄 Aggiorna registro</button>
+</div>
+
+<p class="foot">Versione di test — dati salvati sul foglio Google Sheets condiviso</p>
+
+<script>
+const CHIAVE = 'presenze_nido_registro';
+const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzBFTWzqzeBiJAT6XO-ReuAaXZl9qLq2q-6iuBFj5ZdhyXr5phYlIu7tjo_HQGjGW6vBw/exec';
+let downloads = null;
+let stream = null;
+let scansionando = false;
+
+// --- capability download, richiesta al caricamento ---
+if (window.claude && window.claude.use) {
+  window.claude.use('downloads').then(d => { downloads = d; }).catch(()=>{});
+}
+
+function oggiFormattato(){
+  const d = new Date();
+  return String(d.getDate()).padStart(2,'0')+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+d.getFullYear();
+}
+function oraFormattata(){
+  const d = new Date();
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');
+}
+
+/** Legge tutte le righe direttamente dal foglio Google (sempre dati aggiornati) */
+async function leggiRegistroRemoto(){
+  const risposta = await fetch(URL_SCRIPT, { method: 'GET' });
+  if (!risposta.ok) throw new Error('Impossibile leggere il foglio (' + risposta.status + ')');
+  const righeGrezze = await risposta.json(); // array di array, prima riga = intestazioni
+  return righeGrezze.slice(1)
+    .filter(r => r.length >= 4 && r[0])
+    .map(r => ({ op: String(r[0]), data: String(r[1]), ora: String(r[2]), tipo: String(r[3]) }));
+}
+
+/** Scrive una nuova timbratura sul foglio Google */
+async function scriviTimbraturaRemota(riga){
+  await fetch(URL_SCRIPT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // evita il preflight CORS
+    body: JSON.stringify(riga)
+  });
+}
+
+async function registraTimbratura(codice){
+  const risultato = document.getElementById('risultato');
+  try {
+    risultato.textContent = 'Controllo il registro…';
+    const righe = await leggiRegistroRemoto();
+    const oggi = oggiFormattato();
+    const righeOperatoreOggi = righe.filter(r => r.op === codice && r.data === oggi);
+    const ultima = righeOperatoreOggi[righeOperatoreOggi.length - 1];
+    const tipo = (ultima && ultima.tipo === 'ENTRATA') ? 'USCITA' : 'ENTRATA';
+    const ora = oraFormattata();
+
+    risultato.textContent = 'Scrittura in corso…';
+    await scriviTimbraturaRemota({ operatore: codice, data: oggi, ora, tipo });
+
+    risultato.textContent = codice + ' — ' + tipo + ' registrata alle ' + ora;
+    await aggiornaTabella();
+  } catch (errore) {
+    risultato.textContent = 'Errore di collegamento al foglio: ' + errore.message;
+  }
+}
+
+async function aggiornaTabella(){
+  try {
+    const righe = (await leggiRegistroRemoto()).slice().reverse();
+    const corpo = document.getElementById('corpoTabella');
+    corpo.innerHTML = '';
+    righe.forEach(r => {
+      const tr = document.createElement('tr');
+      const classeBadge = r.tipo === 'ENTRATA' ? 'badge-in' : 'badge-out';
+      tr.innerHTML = '<td>'+r.op+'</td><td>'+r.data+'</td><td>'+r.ora+'</td>'+
+        '<td><span class="badge '+classeBadge+'">'+r.tipo+'</span></td>';
+      corpo.appendChild(tr);
+    });
+  } catch(e) { /* silenzioso: la tabella resta com'era */ }
+}
+
+// ---------- NFC (Web NFC API — Chrome su Android) ----------
+document.getElementById('btnNfc').addEventListener('click', async () => {
+  const risultato = document.getElementById('risultato');
+  if (!('NDEFReader' in window)) {
+    risultato.textContent = 'NFC non supportato in questo browser.\nUsa Chrome su Android, con NFC attivo nelle impostazioni del telefono.';
+    return;
+  }
+  try {
+    const reader = new NDEFReader();
+    await reader.scan();
+    risultato.textContent = 'In ascolto… avvicina un tag NFC.';
+    reader.onreading = (evento) => {
+      for (const record of evento.message.records) {
+        if (record.recordType === 'text') {
+          const decoder = new TextDecoder(record.encoding || 'utf-8');
+          const testo = decoder.decode(record.data).trim();
+          if (testo) { registraTimbratura(testo); return; }
+        }
+      }
+    };
+  } catch (errore) {
+    risultato.textContent = 'Errore NFC: ' + errore.message;
+  }
+});
+
+// ---------- QR (fotocamera + jsQR) ----------
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+document.getElementById('btnQr').addEventListener('click', async () => {
+  if (scansionando) { fermaScansioneQr(); return; }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    video.srcObject = stream;
+    video.style.display = 'block';
+    await video.play();
+    scansionando = true;
+    document.getElementById('btnQr').textContent = '⏹️ Ferma scansione';
+    requestAnimationFrame(cicloScansione);
+  } catch (errore) {
+    document.getElementById('risultato').textContent = 'Errore fotocamera: ' + errore.message;
+  }
+});
+
+function fermaScansioneQr(){
+  scansionando = false;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.style.display = 'none';
+  document.getElementById('btnQr').textContent = '📷 Scansiona QR';
+}
+
+function cicloScansione(){
+  if (!scansionando) return;
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const immagine = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const codice = jsQR(immagine.data, immagine.width, immagine.height);
+    if (codice && codice.data) {
+      fermaScansioneQr();
+      registraTimbratura(codice.data.trim());
+      return;
+    }
+  }
+  requestAnimationFrame(cicloScansione);
+}
+
+// ---------- Export Excel ----------
+document.getElementById('btnCsv').addEventListener('click', async () => {
+  let righe;
+  try {
+    righe = await leggiRegistroRemoto();
+  } catch (errore) {
+    document.getElementById('risultato').textContent = 'Errore di collegamento al foglio: ' + errore.message;
+    return;
+  }
+  if (righe.length === 0) {
+    document.getElementById('risultato').textContent = 'Il registro è vuoto, niente da esportare.';
+    return;
+  }
+
+  // Costruisce il foglio Excel: prima riga intestazioni, poi una riga per timbratura.
+  const datiFoglio = [['Operatore', 'Data', 'Ora', 'Tipo']];
+  righe.forEach(r => datiFoglio.push([r.op, r.data, r.ora, r.tipo]));
+
+  const foglio = XLSX.utils.aoa_to_sheet(datiFoglio);
+  foglio['!cols'] = [{ wch: 14 }, { wch: 12 }, { wch: 10 }, { wch: 10 }]; // larghezza colonne
+  const cartella = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(cartella, foglio, 'Timbrature');
+
+  // Genera i byte del file .xlsx in memoria (senza scaricare nulla ancora).
+  const bytesExcel = XLSX.write(cartella, { bookType: 'xlsx', type: 'array' });
+  const blob = new Blob([bytesExcel], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  });
+
+  if (downloads) {
+    try {
+      await downloads.save({ filename: 'presenze_nido_test.xlsx', data: blob });
+      document.getElementById('risultato').textContent = 'File Excel esportato correttamente.';
+    } catch (errore) {
+      document.getElementById('risultato').textContent = 'Esportazione annullata o non riuscita.';
+    }
+    return;
+  }
+
+  // Fallback: download standard del browser (fuori da claude.ai).
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'presenze_nido_test.xlsx';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    document.getElementById('risultato').textContent = 'File Excel scaricato.';
+  } catch (e) {
+    document.getElementById('risultato').textContent = 'Esportazione non disponibile.';
+  }
+});
+
+// ---------- Aggiorna ----------
+document.getElementById('btnReset').addEventListener('click', async () => {
+  document.getElementById('risultato').textContent = 'Aggiornamento in corso…';
+  await aggiornaTabella();
+  document.getElementById('risultato').textContent = 'Registro aggiornato dal foglio Google.';
+});
+
+aggiornaTabella();
+</script>
+</body>
+</html>
